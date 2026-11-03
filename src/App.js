@@ -143,20 +143,64 @@ async function loadData(user){
   const stored=snap.data();
   return {data:stored?migrate(stored.data):EMPTY_DATA,version:stored?.revision??stored?.updatedAt??null};
 }
-async function saveData(data,user,expectedVersion){
+function sameValue(left,right){
+  if(left===right)return true;
+  if(!left||!right||typeof left!=="object"||typeof right!=="object")return false;
+  if(Array.isArray(left)!==Array.isArray(right))return false;
+  const keys=Object.keys(left);
+  return keys.length===Object.keys(right).length&&
+    keys.every(key=>Object.hasOwn(right,key)&&sameValue(left[key],right[key]));
+}
+
+function saveConflict(){
+  const error=new Error("Data berubah di perangkat lain.");
+  error.code="pinqflow/conflict";
+  return error;
+}
+
+function mergeHouseholdData(previous,next,current){
+  const {transactions:previousTransactions,...previousSettings}=previous;
+  const {transactions:nextTransactions,...nextSettings}=next;
+  const {transactions:currentTransactions,...currentSettings}=current;
+  const settingsChanged=!sameValue(previousSettings,nextSettings);
+  if(settingsChanged&&!sameValue(previousSettings,currentSettings))throw saveConflict();
+
+  const before=new Map(previousTransactions.map(item=>[item.id,item]));
+  const after=new Map(nextTransactions.map(item=>[item.id,item]));
+  const currentById=new Map(currentTransactions.map(item=>[item.id,item]));
+  const merged=new Map(currentById);
+  for(const id of new Set([...before.keys(),...after.keys()])){
+    const oldItem=before.get(id),newItem=after.get(id),currentItem=merged.get(id);
+    if(sameValue(oldItem,newItem)||sameValue(currentItem,newItem))continue;
+    if(!sameValue(oldItem,currentItem))throw saveConflict();
+    if(newItem)merged.set(id,newItem);
+    else merged.delete(id);
+  }
+  const settings=settingsChanged?nextSettings:currentSettings;
+  const wallets=settings.wallets||DEFAULT_WALLETS;
+  const previousWallets=currentSettings.wallets||DEFAULT_WALLETS;
+  for(const item of merged.values()){
+    const usedWallets=[item.wallet||"Cash"];
+    if(item.type==="transfer")usedWallets.push(item.toWallet);
+    if(usedWallets.some(wallet=>previousWallets.includes(wallet)&&!wallets.includes(wallet)))throw saveConflict();
+    if(!sameValue(merged.get(item.id),currentById.get(item.id))&&
+       usedWallets.some(wallet=>(previousSettings.wallets||DEFAULT_WALLETS).includes(wallet)&&!wallets.includes(wallet)))throw saveConflict();
+  }
+  return {...settings,transactions:[...merged.values()]};
+}
+
+async function saveData(data,user,expectedVersion,previous){
   const ref=doc(db,"users",user);
   const revision=uid();
-  await runTransaction(db,async transaction=>{
+  return runTransaction(db,async transaction=>{
     const stored=(await transaction.get(ref)).data();
     const currentVersion=stored?.revision??stored?.updatedAt??null;
-    if(currentVersion!==expectedVersion){
-      const error=new Error("Data berubah di perangkat lain.");
-      error.code="pinqflow/conflict";
-      throw error;
-    }
-    transaction.set(ref,{data,revision,updatedAt:Date.now()});
+    const household=user==="u3";
+    if(!household&&currentVersion!==expectedVersion)throw saveConflict();
+    const next=household?mergeHouseholdData(previous,data,stored?migrate(stored.data):EMPTY_DATA):data;
+    transaction.set(ref,{data:next,revision,updatedAt:Date.now()});
+    return {revision,data:next};
   });
-  return revision;
 }
 const validRecurringDay=day=>Number.isInteger(day)&&day>=1&&day<=28;
 function applyRecurring(data){
@@ -1776,11 +1820,19 @@ function UserApp({user,onLogout}){
   const [saveStatus,setSaveStatus]=useState("idle");
   const saveQueue=useRef(Promise.resolve());
   const version=useRef(null);
+  const lastSaved=useRef(null);
 
   const save=useCallback(next=>{
     setSaveStatus("saving");
     const pending=saveQueue.current.then(async()=>{
-      version.current=await saveData(next,user.id,version.current);
+      const saved=await saveData(next,user.id,version.current,lastSaved.current);
+      version.current=saved.revision;
+      lastSaved.current=next;
+      if(user.id==="u3"&&saveQueue.current===queued){
+        lastSaved.current=saved.data;
+        setData(saved.data);
+        setDarkMode(!!saved.data.darkMode);
+      }
     });
     const queued=pending.catch(()=>{});
     saveQueue.current=queued;
@@ -1795,6 +1847,7 @@ function UserApp({user,onLogout}){
     loadData(user.id).then(({data:loaded,version:loadedVersion})=>{
       if(!active)return;
       version.current=loadedVersion;
+      lastSaved.current=loaded;
       const applied=applyRecurring(loaded);
       setData(applied);
       setDarkMode(!!applied.darkMode);
