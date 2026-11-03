@@ -36,7 +36,7 @@ const rpK   = n => n>=1e6?`Rp ${(n/1e6).toFixed(1)}M`:n>=1e3?`Rp ${(n/1e3).toFix
 const mkKey = d => { const x=new Date(d); return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,"0")}`; };
 const mkLbl = k => { if(!k)return""; const[y,m]=k.split("-"); return `${MONTH_F[+m-1]} ${y}`; };
 const mkLblS= k => { if(!k)return""; const[y,m]=k.split("-"); return `${MONTH_S[+m-1]} ${y}`; };
-const todayFn=()=>{const n=new Date();return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,"0")}-${String(n.getDate()).padStart(2,"0")}`;};
+const todayFn=(n=new Date())=>{return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,"0")}-${String(n.getDate()).padStart(2,"0")}`;};
 const fmtDate=d=>{if(!d||!d.includes("-"))return d||"";const[y,m,dd]=d.split("-");if(!y||!m||!dd)return d;return`${dd}-${m}-${y.slice(-2)}`;};
 const uid   = ()=>Math.random().toString(36).slice(2)+Date.now().toString(36);
 const catC  = (c,i=0)=>CAT_COLOR[c]||PALETTE[i%PALETTE.length];
@@ -147,7 +147,7 @@ async function saveData(data,user){
 }
 function applyRecurring(data){
   const now=new Date(),td=now.getDate(),curMK=mkKey(now);let changed=false;const txs=[...data.transactions];
-  const recs=(data.recurring||[]).map(r=>{if(!r.active||r.lastApplied===curMK)return r;if(r.frequency==="monthly"&&td>=r.dayOfMonth){const exists=txs.some(t=>t.recurringId===r.id&&mkKey(t.date)===curMK);if(!exists){const dd=new Date(now.getFullYear(),now.getMonth(),r.dayOfMonth);txs.push({id:uid(),date:dd.toISOString().split("T")[0],description:r.description+" (auto)",category:r.category,amount:r.amount,type:r.type,wallet:r.wallet||"Cash",recurringId:r.id});changed=true;}return{...r,lastApplied:curMK};}return r;});
+  const recs=(data.recurring||[]).map(r=>{if(!r.active||r.lastApplied===curMK)return r;if(r.frequency==="monthly"&&td>=r.dayOfMonth){const exists=txs.some(t=>t.recurringId===r.id&&mkKey(t.date)===curMK);if(!exists){const dd=new Date(now.getFullYear(),now.getMonth(),r.dayOfMonth);txs.push({id:uid(),date:todayFn(dd),description:r.description+" (auto)",category:r.category,amount:r.amount,type:r.type,wallet:r.wallet||"Cash",recurringId:r.id});changed=true;}return{...r,lastApplied:curMK};}return r;});
   return(changed||JSON.stringify(recs)!==JSON.stringify(data.recurring))?{...data,transactions:txs,recurring:recs}:data;
 }
 function exportCSV(txs,month){const h=["Date","Description","Category","Wallet","To Wallet","Type","Amount"];const rows=txs.map(t=>[t.date,t.description,t.category,t.wallet||"Cash",t.toWallet||"",t.type==="income"?"Income":t.type==="expense"?"Expense":"Transfer",t.amount]);const csv="\uFEFF"+[h,...rows].map(r=>r.map(c=>`"${c}"`).join(",")).join("\n");Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8;"})),download:`PinqFlow_${month}.csv`}).click();}
@@ -231,7 +231,7 @@ function YearlySummary({data}){
   const C=useTheme();
   const card=mkCard(C);
   const [open,setOpen]=useState(false);
-  const now=new Date(),year=now.getFullYear(),todayStr=now.toISOString().split("T")[0];
+  const now=new Date(),year=now.getFullYear(),todayStr=todayFn(now);
   const ytd=data.transactions.filter(t=>t.date>=`${year}-01-01`&&t.date<=todayStr);
   const ytdInc=ytd.filter(t=>t.type==="income").reduce((s,t)=>s+t.amount,0);
   const ytdExp=ytd.filter(t=>t.type==="expense").reduce((s,t)=>s+t.amount,0);
@@ -1107,8 +1107,9 @@ function WalletPage({data,updateData}){
     updateData({...data,wallets:[...wallets,newW.trim()]});
     setNewW("");setOk(true);setTimeout(()=>setOk(false),1500);
   };
+  const hasHistory=w=>allTxs.some(t=>(t.wallet||"Cash")===w||(t.type==="transfer"&&t.toWallet===w));
   const remove=w=>{
-    if(DEFAULT_WALLETS.includes(w))return;
+    if(DEFAULT_WALLETS.includes(w)||hasHistory(w))return;
     updateData({...data,wallets:wallets.filter(x=>x!==w)});
   };
   const totalBal=wallets.reduce((s,w)=>s+walletBal(w,allTxs),0);
@@ -1136,7 +1137,8 @@ function WalletPage({data,updateData}){
             </div>
             <div style={{textAlign:"right"}}>
               <div style={{fontFamily:MONO,fontSize:15,fontWeight:800,color:bal>=0?C.mintD:C.coral}}>{bal>=0?"+":""}{rp(bal)}</div>
-              {!isDefault&&<button onClick={()=>remove(w)} style={{fontSize:10,color:C.coral,background:"none",border:"none",cursor:"pointer",padding:"2px 0",marginTop:2}}>Remove</button>}
+              {!isDefault&&hasHistory(w)&&<span style={{fontSize:10,color:C.muted}}>Has transactions</span>}
+              {!isDefault&&!hasHistory(w)&&<button onClick={()=>remove(w)} style={{fontSize:10,color:C.coral,background:"none",border:"none",cursor:"pointer",padding:"2px 0",marginTop:2}}>Remove</button>}
             </div>
           </div>
         );
