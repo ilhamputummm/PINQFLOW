@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useContext } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, AreaChart, Area, PieChart, Pie, Cell } from "recharts";
 import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, setDoc } from "firebase/firestore";
+import { getFirestore, doc, getDoc, runTransaction, setDoc } from "firebase/firestore";
 
 
 // ─── CATEGORIES ───────────────────────────────────────────────────────────────
@@ -140,14 +140,28 @@ const DESC_TO_CAT={"Token Listrik":"Utilities","Token Listrik Sentul":"Utilities
 function migrate(d){const txs=d.transactions.map(t=>{const byD=DESC_TO_CAT[t.description];if(byD)return{...t,category:byD};const nC=CAT_MIGRATE[t.category];return nC?{...t,category:nC}:t;});return{...d,transactions:txs};}
 async function loadData(user){
   const snap=await getDoc(doc(db,"users",user));
-  return snap.exists()?migrate(snap.data().data):EMPTY_DATA;
+  const stored=snap.data();
+  return {data:stored?migrate(stored.data):EMPTY_DATA,version:stored?.revision??stored?.updatedAt??null};
 }
-async function saveData(data,user){
-  await setDoc(doc(db,"users",user),{data,updatedAt:Date.now()});
+async function saveData(data,user,expectedVersion){
+  const ref=doc(db,"users",user);
+  const revision=uid();
+  await runTransaction(db,async transaction=>{
+    const stored=(await transaction.get(ref)).data();
+    const currentVersion=stored?.revision??stored?.updatedAt??null;
+    if(currentVersion!==expectedVersion){
+      const error=new Error("Data berubah di perangkat lain.");
+      error.code="pinqflow/conflict";
+      throw error;
+    }
+    transaction.set(ref,{data,revision,updatedAt:Date.now()});
+  });
+  return revision;
 }
+const validRecurringDay=day=>Number.isInteger(day)&&day>=1&&day<=28;
 function applyRecurring(data){
   const now=new Date(),td=now.getDate(),curMK=mkKey(now);let changed=false;const txs=[...data.transactions];
-  const recs=(data.recurring||[]).map(r=>{if(!r.active||r.lastApplied===curMK)return r;if(r.frequency==="monthly"&&td>=r.dayOfMonth){const exists=txs.some(t=>t.recurringId===r.id&&mkKey(t.date)===curMK);if(!exists){const dd=new Date(now.getFullYear(),now.getMonth(),r.dayOfMonth);txs.push({id:uid(),date:todayFn(dd),description:r.description+" (auto)",category:r.category,amount:r.amount,type:r.type,wallet:r.wallet||"Cash",recurringId:r.id});changed=true;}return{...r,lastApplied:curMK};}return r;});
+  const recs=(data.recurring||[]).map(r=>{if(!r.active||!validRecurringDay(r.dayOfMonth)||r.lastApplied===curMK)return r;if(r.frequency==="monthly"&&td>=r.dayOfMonth){const exists=txs.some(t=>t.recurringId===r.id&&mkKey(t.date)===curMK);if(!exists){const dd=new Date(now.getFullYear(),now.getMonth(),r.dayOfMonth);txs.push({id:uid(),date:todayFn(dd),description:r.description+" (auto)",category:r.category,amount:r.amount,type:r.type,wallet:r.wallet||"Cash",recurringId:r.id});changed=true;}return{...r,lastApplied:curMK};}return r;});
   return(changed||JSON.stringify(recs)!==JSON.stringify(data.recurring))?{...data,transactions:txs,recurring:recs}:data;
 }
 function exportCSV(txs,month){const h=["Date","Description","Category","Wallet","To Wallet","Type","Amount"];const rows=txs.map(t=>[t.date,t.description,t.category,t.wallet||"Cash",t.toWallet||"",t.type==="income"?"Income":t.type==="expense"?"Expense":"Transfer",t.amount]);const csv="\uFEFF"+[h,...rows].map(r=>r.map(c=>`"${c}"`).join(",")).join("\n");Object.assign(document.createElement("a"),{href:URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8;"})),download:`PinqFlow_${month}.csv`}).click();}
@@ -692,7 +706,7 @@ function InputForm({data,updateData}){
   const QUICK_AMTS=[10000,25000,50000,100000,200000,500000];
   const addAmt=a=>{const cur=parseInt((form.amount||"0").replace(/\D/g,""))||0;setForm(f=>({...f,amount:(cur+a).toLocaleString("id-ID")}));};
   const submit=()=>{
-    if(!form.amount)return;
+    if(!form.amount||(mode!=="transfer"&&isRec&&!validRecurringDay(recDay)))return;
     const amount=parseInt(form.amount.replace(/\D/g,""));if(!amount)return;
     if(mode==="transfer"){
       if(form.wallet===form.toWallet)return;
@@ -770,7 +784,7 @@ function InputForm({data,updateData}){
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 16px",background:C.inpBg,borderRadius:14,border:`1px solid ${isRec?C.mint:C.border}`}}>
             <div>
               <div style={{fontSize:13,fontWeight:700,color:C.navy}}>🔄 Recurring</div>
-              {isRec&&<div style={{fontSize:11,color:C.muted,marginTop:3}}>Auto-add every month on day {recDay}</div>}
+              {isRec&&<div style={{fontSize:11,color:C.muted,marginTop:3}}>{validRecurringDay(recDay)?`Auto-add every month on day ${recDay}`:"Pilih tanggal 1–28 untuk jadwal berulang."}</div>}
             </div>
             <div style={{display:"flex",alignItems:"center",gap:10}}>
               {isRec&&<input type="number" min={1} max={28} value={recDay} onChange={e=>setRecDay(+e.target.value)} style={{...inp,width:56,padding:"6px 10px",textAlign:"center",fontSize:14,fontWeight:700}}/>}
@@ -1517,10 +1531,7 @@ async function loadAccounts(){
   return DEFAULT_ACCOUNTS;
 }
 async function saveAccounts(accs){
-  try{
-    const ref=doc(db,"config","accounts");
-    await setDoc(ref,{accounts:accs});
-  }catch(e){console.error("saveAccounts error:",e);}
+  await setDoc(doc(db,"config","accounts"),{accounts:accs});
 }
 
 // ─── PIN KEYPAD ───────────────────────────────────────────────────────────────
@@ -1570,6 +1581,8 @@ function LoginScreen({onLogin,C}){
   const [editPinConfirm,setEditPinConfirm]=useState("");
   const [editStep,setEditStep]=useState("info"); // info | pin1 | pin2
   const [pinError,setPinError]=useState("");
+  const [accountSaveError,setAccountSaveError]=useState("");
+  const savingAccount=useRef(false);
   const EMOJIS=["🐧","🦊","🐻","🦋","🐬","🦁","🐯","🐺","🦅","🦄","🐙","🦖","🌟","🔥","⚡","🎯","🚀","💎"];
 
   useEffect(()=>{loadAccounts().then(setAccounts);},[]);
@@ -1595,13 +1608,28 @@ function LoginScreen({onLogin,C}){
     setEditName(acc.name);
     setEditEmoji(acc.emoji);
     setEditPin("");setEditPinConfirm("");
-    setEditStep("info");setPinError("");
+    setEditStep("info");setPinError("");setAccountSaveError("");
     setScreen("edit");
+  };
+
+  const persistAccounts=async updated=>{
+    if(savingAccount.current)return;
+    savingAccount.current=true;
+    setAccountSaveError("");
+    try{
+      await saveAccounts(updated);
+      setAccounts(updated);
+      setScreen("list");
+    }catch{
+      setAccountSaveError("Perubahan akun belum tersimpan. Silakan coba lagi.");
+    }finally{
+      savingAccount.current=false;
+    }
   };
 
   const saveEdit=async()=>{
     const updated=accounts.map(a=>a.id===selectedAcc.id?{...a,name:editName||a.name,emoji:editEmoji||a.emoji}:a);
-    setAccounts(updated);await saveAccounts(updated);setScreen("list");
+    await persistAccounts(updated);
   };
 
   const handleSetPin=(p)=>{
@@ -1609,7 +1637,7 @@ function LoginScreen({onLogin,C}){
     else if(editStep==="pin2"){
       if(p===editPin){
         const updated=accounts.map(a=>a.id===selectedAcc.id?{...a,name:editName||a.name,emoji:editEmoji||a.emoji,pin:p}:a);
-        setAccounts(updated);saveAccounts(updated);setScreen("list");
+        persistAccounts(updated);
       } else {
         setPinError("PIN tidak cocok, coba lagi");
         setEditStep("pin1");setEditPin("");
@@ -1620,8 +1648,10 @@ function LoginScreen({onLogin,C}){
 
   const removePin=async()=>{
     const updated=accounts.map(a=>a.id===selectedAcc.id?{...a,pin:""}:a);
-    setAccounts(updated);await saveAccounts(updated);setScreen("list");
+    await persistAccounts(updated);
   };
+
+  if(accountSaveError)return <div role="alert">{accountSaveError} <button onClick={()=>{setAccountSaveError("");setEditStep("info");}}>Kembali ke pengaturan akun</button></div>;
 
   if(!accounts)return<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:C.bg}}><div style={{fontSize:13,color:C.muted}}>Memuat akun...</div></div>;
 
@@ -1745,22 +1775,26 @@ function UserApp({user,onLogout}){
   const [loadError,setLoadError]=useState(false);
   const [saveStatus,setSaveStatus]=useState("idle");
   const saveQueue=useRef(Promise.resolve());
+  const version=useRef(null);
 
   const save=useCallback(next=>{
     setSaveStatus("saving");
-    const pending=saveQueue.current.then(()=>saveData(next,user.id));
+    const pending=saveQueue.current.then(async()=>{
+      version.current=await saveData(next,user.id,version.current);
+    });
     const queued=pending.catch(()=>{});
     saveQueue.current=queued;
     pending.then(
       ()=>{if(saveQueue.current===queued)setSaveStatus("idle");},
-      ()=>{if(saveQueue.current===queued)setSaveStatus("error");}
+      error=>{if(saveQueue.current===queued)setSaveStatus(error.code==="pinqflow/conflict"?"conflict":"error");}
     );
   },[user.id]);
 
   useEffect(()=>{
     let active=true;
-    loadData(user.id).then(loaded=>{
+    loadData(user.id).then(({data:loaded,version:loadedVersion})=>{
       if(!active)return;
+      version.current=loadedVersion;
       const applied=applyRecurring(loaded);
       setData(applied);
       setDarkMode(!!applied.darkMode);
@@ -1807,6 +1841,10 @@ function UserApp({user,onLogout}){
   return(
     <ThemeCtx.Provider value={C}>
       {saveStatus==="saving"&&<div role="status">Menyimpan perubahan...</div>}
+      {saveStatus==="conflict"&&<div role="alert">
+        Perangkat lain sudah menyimpan perubahan. Perubahan di layar ini belum tersimpan.
+        <button onClick={()=>{if(window.confirm("Muat data terbaru dan buang perubahan lokal yang belum tersimpan?"))window.location.reload();}}>Muat data terbaru</button>
+      </div>}
       {saveStatus==="error"&&<div role="alert">
         Perubahan belum tersimpan.
         <button onClick={()=>save(data)}>Coba simpan lagi</button>
